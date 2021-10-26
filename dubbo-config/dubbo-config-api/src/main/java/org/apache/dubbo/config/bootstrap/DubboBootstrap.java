@@ -77,15 +77,15 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
-import java.util.Map;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.SortedSet;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
@@ -642,7 +642,7 @@ public class DubboBootstrap {
         for (MetadataReportConfig metadataReportConfig : metadataReportConfigs) {
             ConfigValidationUtils.validateMetadataConfig(metadataReportConfig);
             if (!metadataReportConfig.isValid()) {
-                return;
+                continue;
             }
             MetadataReportInstance.init(metadataReportConfig);
         }
@@ -680,6 +680,10 @@ public class DubboBootstrap {
         String protocol = registryConfig.getProtocol();
         Integer port = registryConfig.getPort();
         String id = "config-center-" + protocol + "-" + port;
+        if (configManager.getConfigCenter(id) != null) {
+            return null;
+        }
+
         ConfigCenterConfig cc = new ConfigCenterConfig();
         cc.setId(id);
         if (cc.getParameters() == null) {
@@ -781,6 +785,10 @@ public class DubboBootstrap {
         String protocol = registryConfig.getProtocol();
         Integer port = registryConfig.getPort();
         String id = "metadata-center-" + protocol + "-" + port;
+        if (configManager.getMetadataConfig(id) != null) {
+            return null;
+        }
+
         MetadataReportConfig metadataReportConfig = new MetadataReportConfig();
         metadataReportConfig.setId(id);
         if (metadataReportConfig.getParameters() == null) {
@@ -868,6 +876,7 @@ public class DubboBootstrap {
      */
     public DubboBootstrap start() {
         if (started.compareAndSet(false, true)) {
+            destroyed.set(false);
             ready.set(false);
             initialize();
             if (logger.isInfoEnabled()) {
@@ -1025,8 +1034,17 @@ public class DubboBootstrap {
             }
             try {
                 environment.setConfigCenterFirst(configCenter.isHighestPriority());
-                environment.updateExternalConfigurationMap(parseProperties(configContent));
-                environment.updateAppExternalConfigurationMap(parseProperties(appConfigContent));
+                Map<String, String> globalRemoteProperties = parseProperties(configContent);
+                if (CollectionUtils.isEmptyMap(globalRemoteProperties)) {
+                    logger.info("No global configuration in config center");
+                }
+                environment.updateExternalConfigurationMap(globalRemoteProperties);
+
+                Map<String, String> appRemoteProperties = parseProperties(appConfigContent);
+                if (CollectionUtils.isEmptyMap(appRemoteProperties)) {
+                    logger.info("No application level configuration in config center");
+                }
+                environment.updateAppExternalConfigurationMap(appRemoteProperties);
             } catch (IOException e) {
                 throw new IllegalStateException("Failed to parse configurations from Config Center.", e);
             }
@@ -1178,7 +1196,7 @@ public class DubboBootstrap {
         {
             calInstanceRevision(serviceDiscovery, serviceInstance);
             if (logger.isDebugEnabled()) {
-                logger.info("Start registering instance address to registry" + serviceDiscovery.getUrl() + ", instance " + serviceInstance);
+                logger.debug("Start registering instance address to registry" + serviceDiscovery.getUrl() + ", instance " + serviceInstance);
             }
             // register metadata
             serviceDiscovery.register(serviceInstance);
@@ -1200,9 +1218,6 @@ public class DubboBootstrap {
 
         for (String urlValue : urlValues) {
             URL url = URL.valueOf(urlValue);
-            if (MetadataService.class.getName().equals(url.getServiceInterface())) {
-                continue;
-            }
             if ("rest".equals(url.getProtocol())) { // REST first
                 selectedURL = url;
                 break;
@@ -1220,9 +1235,7 @@ public class DubboBootstrap {
 
     private void unregisterServiceInstance() {
         if (serviceInstance != null) {
-            getServiceDiscoveries().forEach(serviceDiscovery -> {
-                serviceDiscovery.unregister(serviceInstance);
-            });
+            getServiceDiscoveries().forEach(serviceDiscovery -> serviceDiscovery.unregister(serviceInstance));
         }
     }
 
@@ -1244,27 +1257,24 @@ public class DubboBootstrap {
     public void destroy() {
         if (destroyLock.tryLock()) {
             try {
-                DubboShutdownHook.destroyAll();
-
-                if (started.compareAndSet(true, false)
-                        && destroyed.compareAndSet(false, true)) {
-
-                    unregisterServiceInstance();
-                    unexportMetadataService();
-                    unexportServices();
-                    unreferServices();
-
-                    destroyRegistries();
-
+                if (destroyed.compareAndSet(false, true)) {
+                    if (started.compareAndSet(true, false)) {
+                        unregisterServiceInstance();
+                        unexportMetadataService();
+                        unexportServices();
+                        unreferServices();
+                    }
                     destroyServiceDiscoveries();
                     destroyExecutorRepository();
-                    clear();
-                    shutdown();
+                    DubboShutdownHook.destroyAll();
+                    clearConfigManager();
+                    shutdownExecutor();
                     release();
                     ExtensionLoader<DubboBootstrapStartStopListener> exts = getExtensionLoader(DubboBootstrapStartStopListener.class);
                     exts.getSupportedExtensionInstances().forEach(ext -> ext.onStop(this));
                 }
             } finally {
+                initialized.set(false);
                 destroyLock.unlock();
             }
         }
@@ -1279,21 +1289,14 @@ public class DubboBootstrap {
     }
 
     private void destroyServiceDiscoveries() {
-        getServiceDiscoveries().forEach(serviceDiscovery -> {
-            execute(serviceDiscovery::destroy);
-        });
+        getServiceDiscoveries().forEach(serviceDiscovery -> execute(serviceDiscovery::destroy));
         if (logger.isDebugEnabled()) {
             logger.debug(NAME + "'s all ServiceDiscoveries have been destroyed.");
         }
     }
 
-    private void clear() {
+    private void clearConfigManager() {
         clearConfigs();
-        clearApplicationModel();
-    }
-
-    private void clearApplicationModel() {
-
     }
 
     private void clearConfigs() {
@@ -1314,7 +1317,7 @@ public class DubboBootstrap {
         });
     }
 
-    private void shutdown() {
+    private void shutdownExecutor() {
         if (!executorService.isShutdown()) {
             // Shutdown executorService
             executorService.shutdown();
@@ -1414,6 +1417,7 @@ public class DubboBootstrap {
      */
     @Deprecated
     public static void reset(boolean destroy) {
+        DubboShutdownHook.reset();
         if (destroy) {
             if (instance != null) {
                 instance.destroy();

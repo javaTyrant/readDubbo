@@ -106,6 +106,9 @@ public class ThreadNameTest {
             if (!success) {
                 success = Thread.currentThread().getName().matches(message);
             }
+            if (success) {
+                latch.countDown();
+            }
         }
 
         private void output(String method) {
@@ -121,28 +124,26 @@ public class ThreadNameTest {
 
         @Override
         public void disconnected(Channel channel) throws RemotingException {
+            // client: DubboClientHandler thread, server: DubboServerHandler or DubboSharedHandler thread.
             output("disconnected");
-            checkThreadName();
         }
 
         @Override
         public void sent(Channel channel, Object message) throws RemotingException {
+            // main thread.
             output("sent");
-            checkThreadName();
-            latch.countDown();
         }
 
         @Override
         public void received(Channel channel, Object message) throws RemotingException {
+            // server: DubboServerHandler or DubboSharedHandler thread.
             output("received");
-            checkThreadName();
-            latch.countDown();
         }
 
         @Override
         public void caught(Channel channel, Throwable exception) throws RemotingException {
+            // client: DubboClientHandler thread, server: ?
             output("caught");
-            checkThreadName();
         }
     }
 
